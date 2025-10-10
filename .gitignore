@@ -1,3 +1,6 @@
 .env
 *.csv
 __pycache__
+logs
+rag
+data
