@@ -157,6 +157,45 @@ Rerunning the script without changes is idempotent: previously processed images 
 FORCE_REPROCESS=1 uv run main.py
 ```
 
+## Qdrant ingestion
+
+You can index the generated chunks into Qdrant using the Ollama embeddings API.
+
+- **Prerequisites**
+
+  - Qdrant running at `QDRANT_URL` (default `http://localhost:6333`).
+  - An Ollama endpoint that supports `/api/embed` with `{ model, input }`.
+  - The model is available on the Ollama server (e.g., `nomic-embed-text-large`).
+
+- **Optional .env entries**:
+
+  ```env
+  QDRANT_URL=http://localhost:6333
+  QDRANT_COLLECTION=pdn_slider
+  RAG_DIR=data/rag
+  OLLAMA_URL=http://localhost:11434
+  OLLAMA_MODEL=nomic-embed-text-large
+  ```
+
+- **Ingest JSONL**
+
+  ```bash
+  uv run ingest_qdrant.py \
+    --source jsonl \
+    --collection pdn_slider \
+    --qdrant-url http://localhost:6333 \
+    --ollama-url http://localhost:11434 \
+    --ollama-model nomic-embed-text-large
+  ```
+
+- **Ingest from canonical records directory**
+
+  ```bash
+  uv run ingest_qdrant.py --source records \
+    --ollama-url http://localhost:11434 \
+    --ollama-model nomic-embed-text-large
+  ```
+
 ## Configuration
 
 The `config.py` file contains key constants used throughout the project:

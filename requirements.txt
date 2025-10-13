@@ -3,3 +3,4 @@ python-dotenv==1.0.1
 groq
 requests
 beautifulsoup4
+qdrant-client
