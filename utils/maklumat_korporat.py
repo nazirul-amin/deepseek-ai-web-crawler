@@ -4,8 +4,10 @@ import hashlib
 from typing import List, Dict, Optional, Tuple, Set
 from urllib.parse import urljoin, urlparse
 
+import requests
 from bs4 import BeautifulSoup
 from crawl4ai import AsyncWebCrawler, CacheMode, CrawlerRunConfig
+from pypdf import PdfReader
 
 from utils.logger import get_logger
 from utils.homepage import download_image, groq_analyze_image  # reuse
@@ -28,9 +30,9 @@ async def fetch_html(crawler: AsyncWebCrawler, url: str) -> Optional[str]:
         config=CrawlerRunConfig(
             cache_mode=CacheMode.BYPASS,
             session_id="pdn_maklumat_korporat_session",
-            process_iframes=True,
+            process_iframes=False,
             remove_overlay_elements=True,
-            excluded_tags=["form", "header", "nav"],
+            excluded_tags=["form"],
         ),
     )
     if not result.success:
@@ -38,6 +40,87 @@ async def fetch_html(crawler: AsyncWebCrawler, url: str) -> Optional[str]:
         return None
     html = getattr(result, "html", None) or getattr(result, "cleaned_html", None)
     return html
+
+
+def download_file(url: str, dest_dir: str) -> Optional[str]:
+    """Download a file (e.g., PDF) to dest_dir using md5(url)+ext. Returns local path or None."""
+    os.makedirs(dest_dir, exist_ok=True)
+    parsed_path = urlparse(url).path
+    ext = os.path.splitext(parsed_path)[1].lower() or ""
+    name = f"{_safe_id(url)}{ext}"
+    local_path = os.path.join(dest_dir, name)
+    if os.path.exists(local_path):
+        return local_path
+    try:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0 Safari/537.36"
+            )
+        }
+        resp = requests.get(url, timeout=60, headers=headers, allow_redirects=True)
+        resp.raise_for_status()
+        with open(local_path, "wb") as f:
+            f.write(resp.content)
+        return local_path
+    except Exception as e:
+        logger.warning(f"Failed to download file {url}: {e}")
+        return None
+
+
+def extract_pdf_text(local_path: str, max_chars: int = 20000) -> str:
+    """Extract text from a PDF using pypdf. Truncate to max_chars to keep prompt size reasonable."""
+    try:
+        reader = PdfReader(local_path)
+        parts: List[str] = []
+        for page in reader.pages:
+            t = page.extract_text() or ""
+            if t:
+                parts.append(t)
+        text = "\n".join(parts)
+        if len(text) > max_chars:
+            text = text[:max_chars]
+        return text
+    except Exception as e:
+        logger.warning(f"Failed to extract PDF text from {local_path}: {e}")
+        return ""
+
+
+def groq_analyze_text(doc_text: str, api_key: Optional[str], model: Optional[str]) -> Optional[Dict]:
+    """Analyze plain text with Groq and return structured JSON fields similar to image analysis."""
+    if not api_key or not model:
+        return None
+    try:
+        from groq import Groq
+    except Exception as e:
+        logger.warning("Groq SDK not available for text analysis; skipping.")
+        return None
+    client = Groq(api_key=api_key)
+
+    system_prompt = (
+        "You analyze document text and return structured JSON. "
+        "Extract: title, summary (<= 120 words), language, labels (list), entities (list), "
+        "date (if any), urls (list). Respond with ONLY valid JSON."
+    )
+    user_text = (
+        "Analyze the following document text and extract the requested fields. "
+        "If no explicit title, infer a concise one."
+    )
+    completion = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"{user_text}\n\nTEXT:\n{doc_text}"},
+        ],
+        temperature=0.2,
+        max_tokens=1200,
+    )
+    text = completion.choices[0].message.content or "{}"
+    try:
+        return json.loads(text)
+    except Exception:
+        return {"raw": text}
 
 
 def parse_nav_links(nav_html: str, base_url: str) -> List[str]:
@@ -69,20 +152,45 @@ def parse_nav_links(nav_html: str, base_url: str) -> List[str]:
 
 
 def extract_main_body(html: str) -> Tuple[str, List[Dict], List[str]]:
-    """Return text, image tags (src, alt), and in-body links from .mainbody-wrapper."""
+    """Return text, image tags (src, alt), and in body links from .mainbody-wrapper."""
     soup = BeautifulSoup(html, "html.parser")
-    container = soup.select_one(".mainbody-wrapper")
+    container = soup.select_one(".mainbody-wrapper main.tm-content") or soup.select_one(".mainbody-wrapper")
     if not container:
         return "", [], []
 
-    # Collect text from headings, paragraphs, list items
-    text_parts: List[str] = []
-    for sel in ["h1", "h2", "h3", "h4", "h5", "h6", "p", "li"]:
+    # Remove unwanted sections
+    for sel in [
+        ".uk-breadcrumb",
+        ".itemContentFooter",
+        ".itemBackToTop",
+        ".clr",
+        "script",
+        "style",
+    ]:
         for el in container.select(sel):
-            t = (el.get_text(" ", strip=True) or "").strip()
-            if t:
-                text_parts.append(t)
-    content_text = "\n".join(text_parts)
+            el.decompose()
+
+    # Collect text from the remaining main body.
+    # Use newlines to better separate sections; capture table cell contents too.
+    content_text = (container.get_text("\n", strip=True) or "").strip()
+    # Filter noisy lines like breadcrumbs, warnings, footer stats, back-to-top, plugin boilerplate
+    filtered_lines: List[str] = []
+    for line in content_text.splitlines():
+        lt = (line or "").strip()
+        if not lt:
+            continue
+        if lt.startswith("Warning") or "count(): Parameter must be an array" in lt:
+            continue
+        if lt.startswith("Read ") and " times" in lt:
+            continue
+        if lt.startswith("Last modified on"):
+            continue
+        if lt.lower() in ("back to top",):
+            continue
+        if lt.startswith("Plugins:") or lt.startswith("K2 Plugins:") or lt.startswith("JoomlaWorks"):
+            continue
+        filtered_lines.append(lt)
+    content_text = "\n".join(filtered_lines)
 
     # Collect images
     imgs: List[Dict] = []
@@ -93,7 +201,7 @@ def extract_main_body(html: str) -> Tuple[str, List[Dict], List[str]]:
         alt = img.get("alt", "")
         imgs.append({"src": src, "alt": alt})
 
-    # Collect in-body links
+    # Collect in body links
     links: List[str] = []
     for a in container.select("a[href]"):
         href = a.get("href") or ""
@@ -101,6 +209,33 @@ def extract_main_body(html: str) -> Tuple[str, List[Dict], List[str]]:
             links.append(href)
 
     return content_text, imgs, links
+
+
+def extract_title(html: str) -> Optional[str]:
+    """Extract a page title from the main content or breadcrumb.
+    Priority: first H1 in .mainbody-wrapper → breadcrumb active span → <title> tag.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    container = soup.select_one(".mainbody-wrapper")
+    if container:
+        h1 = container.select_one("h1")
+        if h1:
+            t = (h1.get_text(" ", strip=True) or "").strip()
+            if t:
+                return t
+        # breadcrumb active
+        bc_active = container.select_one(".uk-breadcrumb .uk-active span, .uk-breadcrumb li.uk-active span")
+        if bc_active:
+            t = (bc_active.get_text(" ", strip=True) or "").strip()
+            if t:
+                return t
+    # fallback to document title
+    doc_title = soup.select_one("title")
+    if doc_title:
+        t = (doc_title.get_text(" ", strip=True) or "").strip()
+        if t:
+            return t
+    return None
 
 
 async def process_page(
@@ -123,12 +258,164 @@ async def process_page(
     if page_url in visited:
         return None
     visited.add(page_url)
+    logger.info(f"Visiting page: {page_url}")
 
+    # Determine resource type by extension and handle images/PDFs accordingly
+    parsed_url = urlparse(page_url)
+    path_lower = (parsed_url.path or "").lower()
+    image_exts = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg")
+    pdf_exts = (".pdf",)
+    binary_skip_exts = (".doc", ".docx", ".xls", ".xlsx", ".zip")
+
+    if path_lower.endswith(image_exts):
+        logger.info(f"Resource type detected: image ({path_lower})")
+        # Direct image resource: download and analyze with Groq vision
+        rec_id = _safe_id(page_url)
+        records_dir = os.path.join(rag_dir, "records")
+        chunks_dir = os.path.join(rag_dir, "chunks")
+        _ensure_dirs(records_dir, chunks_dir)
+
+        chunk_path = os.path.join(chunks_dir, f"{rec_id}.txt")
+        record_path = os.path.join(records_dir, f"{rec_id}.json")
+        if os.path.exists(chunk_path) and not force:
+            logger.debug(f"Skipping already processed image resource: {page_url}")
+            return None
+
+        logger.info(f"Downloading image resource: {page_url}")
+        local_path = download_image(page_url, images_dir)
+        if local_path:
+            logger.info(f"Downloaded image to: {local_path}")
+        else:
+            logger.warning(f"Image download failed: {page_url}")
+        analysis = None
+        if local_path and groq_api_key and groq_model:
+            try:
+                logger.info(f"Invoking Groq Vision for image: {page_url}")
+                analysis = groq_analyze_image(local_path, groq_api_key, groq_model)
+                try:
+                    logger.info(f"Groq response (image) keys: {list(analysis.keys()) if isinstance(analysis, dict) else 'n/a'}")
+                except Exception:
+                    pass
+                # Log full Groq response for visibility
+                try:
+                    if isinstance(analysis, dict):
+                        if "raw" in analysis:
+                            logger.info("Groq full response (image, raw): %s", analysis.get("raw", ""))
+                        else:
+                            logger.info(
+                                "Groq full response (image, json): %s",
+                                json.dumps(analysis, ensure_ascii=False, indent=2),
+                            )
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.warning(f"Groq image analysis failed for {page_url}: {e}")
+        # Build minimal content from analysis
+        chunk_text = ""
+        if isinstance(analysis, dict):
+            chunk_text = (analysis.get("summary") or analysis.get("ocr_text") or "").strip()
+
+        record: Dict = {
+            "id": rec_id,
+            "type": "image",
+            "source_url": page_url,
+            "title": (analysis.get("title") if isinstance(analysis, dict) else None),
+            "content": "",
+            "images": [
+                {
+                    "source_url": page_url,
+                    "alt": "",
+                    "local_path": local_path,
+                    "analysis": analysis,
+                }
+            ],
+            "chunk": chunk_text,
+        }
+
+        with open(chunk_path, "w", encoding="utf-8") as f:
+            f.write(chunk_text)
+        with open(record_path, "w", encoding="utf-8") as f:
+            json.dump(record, f, ensure_ascii=False, indent=2)
+        logger.info(f"Wrote image record id={rec_id}, chunk_len={len(chunk_text)} -> {record_path}")
+        return record
+
+    logger.info(f"Visiting page: {page_url}")
+    if path_lower.endswith(pdf_exts):
+        logger.info(f"Resource type detected: pdf ({path_lower})")
+        # Direct PDF resource: download, extract text, analyze with Groq text
+        rec_id = _safe_id(page_url)
+        records_dir = os.path.join(rag_dir, "records")
+        chunks_dir = os.path.join(rag_dir, "chunks")
+        pdfs_dir = os.path.join(os.path.dirname(images_dir), "pdfs")
+        _ensure_dirs(records_dir, chunks_dir, pdfs_dir)
+
+        chunk_path = os.path.join(chunks_dir, f"{rec_id}.txt")
+        record_path = os.path.join(records_dir, f"{rec_id}.json")
+        if os.path.exists(chunk_path) and not force:
+            logger.info(f"Skipping already processed PDF resource: {page_url}")
+            return None
+
+        logger.info(f"Downloading PDF resource: {page_url}")
+        local_path = download_file(page_url, pdfs_dir)
+        if local_path:
+            logger.info(f"Downloaded PDF to: {local_path}")
+        else:
+            logger.warning(f"PDF download failed: {page_url}")
+        doc_text = extract_pdf_text(local_path) if local_path else ""
+        logger.info(f"Extracted PDF text length: {len(doc_text)}")
+        analysis = groq_analyze_text(doc_text, groq_api_key, groq_model) if doc_text else None
+        if isinstance(analysis, dict):
+            try:
+                logger.info(f"Groq response (pdf) keys: {list(analysis.keys())}")
+            except Exception:
+                pass
+            # Log full Groq response for visibility
+            try:
+                if "raw" in analysis:
+                    logger.info("Groq full response (pdf, raw): %s", analysis.get("raw", ""))
+                else:
+                    logger.info(
+                        "Groq full response (pdf, json): %s",
+                        json.dumps(analysis, ensure_ascii=False, indent=2),
+                    )
+            except Exception:
+                pass
+        chunk_text = ""
+        if isinstance(analysis, dict):
+            chunk_text = (analysis.get("summary") or "").strip()
+        if not chunk_text:
+            chunk_text = (doc_text or "")[:6000]
+
+        record: Dict = {
+            "id": rec_id,
+            "type": "document",
+            "source_url": page_url,
+            "title": (analysis.get("title") if isinstance(analysis, dict) else None),
+            "content": doc_text,
+            "images": [],
+            "document_path": local_path,
+            "analysis": analysis,
+            "chunk": chunk_text,
+        }
+
+        with open(chunk_path, "w", encoding="utf-8") as f:
+            f.write(chunk_text)
+        with open(record_path, "w", encoding="utf-8") as f:
+            json.dump(record, f, ensure_ascii=False, indent=2)
+        return record
+
+    if path_lower.endswith(binary_skip_exts):
+        logger.debug(f"Skipping unsupported binary resource: {page_url}")
+        return None
+
+    logger.info(f"Resource type detected: html (page)")
     html = await fetch_html(crawler, page_url)
     if not html:
         return None
 
     content_text, imgs, page_links = extract_main_body(html)
+    logger.info(f"Extracted main content: text_len={len(content_text)}, images={len(imgs)}, links={len(page_links)}")
+    title_text = extract_title(html)
 
     rec_id = _safe_id(page_url)
     records_dir = os.path.join(rag_dir, "records")
@@ -139,7 +426,7 @@ async def process_page(
     record_path = os.path.join(records_dir, f"{rec_id}.json")
 
     if os.path.exists(chunk_path) and not force:
-        logger.debug(f"Skipping already processed page: {page_url}")
+        logger.info(f"Skipping already processed page (no force): {page_url}")
         return None
 
     image_results: List[Dict] = []
@@ -147,11 +434,33 @@ async def process_page(
         abs_src = urljoin(base_url, it["src"]) if it["src"] else None
         if not abs_src:
             continue
+        logger.info(f"Downloading page image: {abs_src}")
         local_path = download_image(abs_src, images_dir)
+        if local_path:
+            logger.info(f"Downloaded page image to: {local_path}")
+        else:
+            logger.warning(f"Page image download failed: {abs_src}")
         analysis = None
         if local_path and groq_api_key and groq_model:
             try:
+                logger.info(f"Invoking Groq Vision for page image: {abs_src}")
                 analysis = groq_analyze_image(local_path, groq_api_key, groq_model)
+                try:
+                    logger.info(f"Groq response (page image) keys: {list(analysis.keys()) if isinstance(analysis, dict) else 'n/a'}")
+                except Exception:
+                    pass
+                # Log full Groq response for visibility
+                try:
+                    if isinstance(analysis, dict):
+                        if "raw" in analysis:
+                            logger.info("Groq full response (page image, raw): %s", analysis.get("raw", ""))
+                        else:
+                            logger.info(
+                                "Groq full response (page image, json): %s",
+                                json.dumps(analysis, ensure_ascii=False, indent=2),
+                            )
+                except Exception:
+                    pass
             except Exception as e:
                 logger.warning(f"Groq analysis failed for {abs_src}: {e}")
         image_results.append({
@@ -166,7 +475,7 @@ async def process_page(
         "id": rec_id,
         "type": "page",
         "source_url": page_url,
-        "title": None,  # can be improved by extracting <h1> if present
+        "title": title_text,
         "content": content_text,
         "images": image_results,
     }
@@ -189,40 +498,39 @@ async def process_page(
 
     record["chunk"] = chunk_text
 
-    # Append to pages.jsonl (separate log file for site pages)
-    pages_jsonl = os.path.join(rag_dir, "pages.jsonl")
-    with open(pages_jsonl, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
     # Write chunk and record
     with open(chunk_path, "w", encoding="utf-8") as f:
         f.write(chunk_text)
     with open(record_path, "w", encoding="utf-8") as f:
         json.dump(record, f, ensure_ascii=False, indent=2)
+    logger.info(f"Wrote page record id={rec_id}, title={title_text!r}, chunk_len={len(chunk_text)} -> {record_path}")
 
-    # Follow in-body links one level deep if allowed
+    # Follow in body links one level deep if allowed
     if depth < max_depth and page_links:
         for href in page_links:
             abs_href = urljoin(base_url, href)
             parsed = urlparse(abs_href)
-            # internal only
+            # internal only; traverse content pages, plus direct image/PDF resources
             if parsed.scheme in ("http", "https") and ("pdn.gov.my" in (parsed.netloc or "")):
-                try:
-                    await process_page(
-                        crawler=crawler,
-                        page_url=abs_href,
-                        base_url=base_url,
-                        images_dir=images_dir,
-                        rag_dir=rag_dir,
-                        groq_api_key=groq_api_key,
-                        groq_model=groq_model,
-                        force=force,
-                        visited=visited,
-                        max_depth=max_depth,
-                        depth=depth + 1,
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed following link {abs_href}: {e}")
+                path_l = (parsed.path or "").lower()
+                if path_l.endswith(image_exts) or path_l.endswith(pdf_exts) or path_l.startswith("/v2/index.php/"):
+                    try:
+                        logger.info(f"Following in body link (depth {depth+1}): {abs_href}")
+                        await process_page(
+                            crawler=crawler,
+                            page_url=abs_href,
+                            base_url=base_url,
+                            images_dir=images_dir,
+                            rag_dir=rag_dir,
+                            groq_api_key=groq_api_key,
+                            groq_model=groq_model,
+                            force=force,
+                            visited=visited,
+                            max_depth=max_depth,
+                            depth=depth + 1,
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed following link {abs_href}: {e}")
 
     return record
 
@@ -239,17 +547,18 @@ async def crawl_maklumat_korporate(
 ) -> Dict:
     """
     Crawl PDN site navigation and extract main body content and images for RAG.
-    Writes RAG artifacts under rag_dir (records/, chunks/, pages.jsonl).
+    Writes RAG artifacts under rag_dir (records/, chunks/).
     """
     _ensure_dirs(images_dir, rag_dir, os.path.join(rag_dir, "records"), os.path.join(rag_dir, "chunks"))
 
-    # Fetch the base page that contains the navigation
+    # Fetch the base page that contains the navigation (keep header/nav)
     nav_html = await fetch_html(crawler, base_url)
     if not nav_html:
         return {"count": 0, "pages": []}
 
     # Parse navigation links
     links = parse_nav_links(nav_html, base_url)
+    logger.info(f"Found {len(links)} navigation links for Maklumat Korporat")
     if not links:
         logger.warning("No navigation links found.")
         return {"count": 0, "pages": []}

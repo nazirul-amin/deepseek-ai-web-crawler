@@ -45,7 +45,7 @@ async def fetch_index_html(crawler: AsyncWebCrawler, url: str, session_id: str) 
         config=CrawlerRunConfig(
             cache_mode=CacheMode.BYPASS,
             session_id=session_id,
-            process_iframes=True,
+            process_iframes=False,
             remove_overlay_elements=True,
             excluded_tags=["form", "header", "nav"],
         ),
@@ -134,9 +134,11 @@ def download_image(url: str, dest_dir: str) -> Optional[str]:
     local_path = os.path.join(dest_dir, name)
 
     if os.path.exists(local_path):
+        logger.info(f"Image already exists, skipping download: {local_path}")
         return local_path
 
     try:
+        logger.info(f"Downloading image: {url}")
         headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -148,6 +150,7 @@ def download_image(url: str, dest_dir: str) -> Optional[str]:
         resp.raise_for_status()
         with open(local_path, "wb") as f:
             f.write(resp.content)
+        logger.info(f"Downloaded image to: {local_path}")
         return local_path
     except Exception as e:
         logger.error(f"Failed to download {url}: {e}")
@@ -214,7 +217,7 @@ async def process_homepage(
 ) -> Dict:
     """
     Process the PDN homepage slider end-to-end.
-    Idempotent by default: if a chunk already exists for an image URL, it skips re-analysis and JSONL append.
+    Idempotent by default: if a chunk already exists for an image URL, it skips re-analysis.
     Set force=True to reprocess.
     """
     _ensure_dirs(images_dir, rag_dir, os.path.join(rag_dir, "chunks"), os.path.join(rag_dir, "records"))
@@ -225,8 +228,6 @@ async def process_homepage(
 
     items = parse_slider_images(html, base_url=page_url)
     logger.info(f"Found {len(items)} slider images")
-
-    out_jsonl = os.path.join(rag_dir, "slider_images.jsonl")
     records_dir = os.path.join(rag_dir, "records")
     processed = []
 
@@ -238,14 +239,35 @@ async def process_homepage(
 
         # Skip if already processed and not forcing re-analysis
         if os.path.exists(chunk_path) and not force:
-            logger.debug(f"Skipping already processed image: {src_url}")
+            logger.info(f"Skipping already processed slider image (no force): {src_url}")
             continue
 
+        logger.info(f"Downloading slider image: {src_url}")
         local = download_image(src_url, images_dir)
         if not local:
+            logger.warning(f"Slider image download failed: {src_url}")
             continue
 
+        logger.info(f"Invoking Groq Vision for slider image: {src_url}")
         analysis = groq_analyze_image(local, api_key=groq_api_key, model=groq_model)
+        try:
+            logger.info(
+                f"Groq response (slider image) keys: {list(analysis.keys()) if isinstance(analysis, dict) else 'n/a'}"
+            )
+        except Exception:
+            pass
+        
+        try:
+            if isinstance(analysis, dict):
+                if "raw" in analysis:
+                    logger.info("Groq full response (slider image, raw): %s", analysis.get("raw", ""))
+                else:
+                    logger.info(
+                        "Groq full response (slider image, json): %s",
+                        json.dumps(analysis, ensure_ascii=False, indent=2),
+                    )
+        except Exception:
+            pass
         chunk_text = analysis.get("summary") or analysis.get("ocr_text") or json.dumps(analysis)[:1000]
 
         record = {
@@ -261,11 +283,6 @@ async def process_homepage(
             "chunk": chunk_text,
         }
 
-        # Append to JSONL (idempotent via skip above)
-        if not os.path.exists(chunk_path):
-            with open(out_jsonl, "a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
         # Write chunk file for easy ingestion
         with open(chunk_path, "w", encoding="utf-8") as f:
             f.write(chunk_text)
@@ -275,5 +292,8 @@ async def process_homepage(
             json.dump(record, f, ensure_ascii=False, indent=2)
 
         processed.append(record)
+        logger.info(
+            f"Wrote slider record id={rec_id}, chunk_len={len(chunk_text)}, local_image={local} -> {record_path}"
+        )
 
     return {"count": len(processed), "items": processed}

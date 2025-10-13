@@ -4,7 +4,7 @@ from crawl4ai import AsyncWebCrawler
 from dotenv import load_dotenv
 
 from config import BASE_URL, GROQ_MODEL, IMAGES_DIR, RAG_DIR
-from utils.scraper_utils import get_browser_config
+from utils.browser_config import get_browser_config
 from utils.homepage import process_homepage
 from utils.maklumat_korporat import crawl_maklumat_korporate
 import os

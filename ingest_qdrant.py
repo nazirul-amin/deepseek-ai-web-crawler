@@ -13,19 +13,10 @@ from dotenv import load_dotenv
 logger = get_logger("ingest_qdrant")
 load_dotenv()
 
-def read_jsonl(path: str) -> Iterable[Dict]:
-    if not os.path.exists(path):
-        logger.error(f"JSONL not found: {path}")
-        return []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                yield json.loads(line)
-            except Exception as e:
-                logger.error(f"Failed to parse JSONL line: {e}")
+def iter_records(rag_dir: str) -> Iterable[Dict]:
+    """Iterate canonical records under rag_dir/records (JSON files)."""
+    records_dir = os.path.join(rag_dir, "records")
+    yield from read_records_dir(records_dir)
 
 
 def read_records_dir(dir_path: str) -> Iterable[Dict]:
@@ -41,15 +32,6 @@ def read_records_dir(dir_path: str) -> Iterable[Dict]:
                 yield json.load(f)
         except Exception as e:
             logger.error(f"Failed to parse {p}: {e}")
-
-
-def iter_source(source: str, rag_dir: str) -> Iterable[Dict]:
-    if source == "jsonl":
-        yield from read_jsonl(os.path.join(rag_dir, "slider_images.jsonl"))
-    elif source == "records":
-        yield from read_records_dir(os.path.join(rag_dir, "records"))
-    else:
-        raise ValueError("source must be 'jsonl' or 'records'")
 
 
 essential_meta = [
@@ -153,12 +135,6 @@ def main():
         help="Path to rag output directory",
     )
     parser.add_argument(
-        "--source",
-        choices=["jsonl", "records"],
-        default="records",
-        help="Whether to read from JSONL or canonical records directory",
-    )
-    parser.add_argument(
         "--collection",
         default=os.environ.get("QDRANT_COLLECTION", "pdn_chatbot"),
         help="Qdrant collection name",
@@ -191,7 +167,7 @@ def main():
     # Load data
     records: List[Dict] = []
     seen_ids = set()
-    for rec in iter_source(args.source, args.rag_dir):
+    for rec in iter_records(args.rag_dir):
         rid = str(rec.get("id") or rec.get("source_url"))
         if not rid or rid in seen_ids:
             continue

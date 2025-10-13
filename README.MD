@@ -12,7 +12,7 @@ This project aims to crawl data across the PDN website. In the initial phase, it
 - SmartSlider DOM parsing with robust selectors and fallbacks
 - Image downloading with browser-like headers
 - Groq multimodal analysis for compact, structured JSON
-- RAG outputs in JSONL and text chunks
+- RAG outputs in per record JSON and text chunks
 - Daily-rotating logs to `logs/app.log`
 
 ## Project Structure
@@ -38,7 +38,7 @@ The homepage SmartSlider pipeline is implemented in `utils/homepage.py` and orch
 - **`parse_slider_images()`**: Parses SmartSlider DOM to extract candidate image entries with fields: `src`, `abs_url`, `alt`, `title`, and optional `public_id`. Uses robust selectors with fallbacks.
 - **`download_image()`**: Downloads each image to `data/images/` with browser-like headers. Skips non-http sources. Saves using `md5(url)+ext` to avoid filename collisions.
 - **`groq_analyze_image()`**: Sends each image to Groq multimodal model (`GROQ_MODEL`) and requests a compact JSON with fields such as `title`, `summary`, `language`, `ocr_text`, `labels`, `entities`, `date`, `call_to_action`, `urls`. Falls back to a `{"raw": "..."}` payload if the response isn’t valid JSON.
-- **`process_homepage()`**: Ties it together: fetch → parse → download → analyze → write outputs. Idempotent by default: if a chunk exists for an image URL, it skips re-analysis and JSONL append (unless forced). For each image it writes one JSON line to `data/rag/slider_images.jsonl`, a text chunk to `data/rag/chunks/<id>.txt`, and a canonical record JSON to `data/rag/records/<id>.json`. Adds `image_sha256` for content-dedup signals.
+- **`process_homepage()`**: Ties it together: fetch → parse → download → analyze → write outputs. Idempotent by default: if a chunk exists for an image URL, it skips re-analysis (unless forced). For each image it writes a text chunk to `data/rag/chunks/<id>.txt`, and a canonical record JSON to `data/rag/records/<id>.json`. Adds `image_sha256` for content-dedup signals.
 
 `main.py` initializes the crawler via `crawl_homepage()` and calls the homepage processing function with your configured `GROQ_API_KEY` and `GROQ_MODEL`.
 
@@ -47,11 +47,10 @@ The homepage SmartSlider pipeline is implemented in `utils/homepage.py` and orch
 Upon completion you will have:
 
 - **Images**: `data/images/`
-- **JSONL**: `data/rag/slider_images.jsonl` (one JSON object per line)
 - **Chunks**: `data/rag/chunks/<id>.txt` (plain text used for embeddings)
 - **Records**: `data/rag/records/<id>.json` (canonical per image record; latest analysis overwrites)
 
-Each JSONL record has this shape:
+Each per record JSON has this shape:
 
 ```json
 {
@@ -85,18 +84,18 @@ Each JSONL record has this shape:
 
 You can ingest the outputs into any vector database (FAISS, Chroma, PgVector, etc.) to ground a chatbot with timely homepage information.
 
-- **What to embed**: Use the `.txt` files in `data/rag/chunks/` or the `chunk` field from JSONL.
+- **What to embed**: Use the `.txt` files in `data/rag/chunks/` or the `chunk` field from the per record JSON.
 - **Metadata to store**: At minimum keep `id`, `source_url`, `alt`, `title`, `public_id`, `llm_model`. Optionally include full `analysis` for filtering and citations.
 - **Retrieval strategy**:
   - Query the vector DB with the user’s question.
   - Retrieve top-k chunks and pass both chunk text and metadata to the LLM.
   - Encourage the model to cite `source_url` or `public_id` in its answer.
 - **Multi-lingual handling**: Use `analysis.language` to filter results or to bias answer language.
-- **Freshness**: Re-run the crawler on a schedule; re-index changed records based on `id` (md5 of image URL) or by comparing JSONL contents.
+- **Freshness**: Re-run the crawler on a schedule; re-index changed records based on `id` (md5 of image URL) or by comparing per record JSON contents.
 
 Example ingestion approach:
 
-1. Read `slider_images.jsonl` line by line, parse JSON, pick `record["chunk"]` for embeddings.
+1. Iterate files under `data/rag/records/`, load each JSON, and pick `record["chunk"]` for embeddings.
 2. Store `record["source_url"]`, `record["title"]`, and `record["analysis"]` as metadata.
 3. Generate embeddings with your preferred model and upsert into your vector DB.
 
@@ -143,7 +142,7 @@ It will:
 - Extract SmartSlider image URLs
 - Download images into `data/images/`
 - Analyze each image with Groq vision
-- Save records to `data/rag/slider_images.jsonl` and chunks to `data/rag/chunks/`
+- Save per record JSONs to `data/rag/records/` and chunks to `data/rag/chunks/`
 
 ```bash
 uv run main.py
@@ -177,21 +176,10 @@ You can index the generated chunks into Qdrant using the Ollama embeddings API.
   OLLAMA_MODEL=nomic-embed-text-large
   ```
 
-- **Ingest JSONL**
-
-  ```bash
-  uv run ingest_qdrant.py \
-    --source jsonl \
-    --collection pdn_chatbot \
-    --qdrant-url http://localhost:6333 \
-    --ollama-url http://localhost:11434 \
-    --ollama-model nomic-embed-text-large
-  ```
-
 - **Ingest from canonical records directory**
 
   ```bash
-  uv run ingest_qdrant.py --source records \
+  uv run ingest_qdrant.py \
     --ollama-url http://localhost:11434 \
     --ollama-model nomic-embed-text-large
   ```
@@ -211,4 +199,4 @@ You can modify these values as needed.
 - **Logging:** Logs are written to console and `logs/app.log` with daily rotation (14 backups).
 - **Improvements:** The code is modular for maintainability and extension.
 - **Dependencies:** Ensure that the package versions specified in `requirements.txt` are installed.
-- **RAG ingestion:** The `.txt` chunks can be ingested into your preferred vector DB (e.g., FAISS, Chroma, PgVector). Use the JSONL file for richer metadata.
+- **RAG ingestion:** The `.txt` chunks can be ingested into your preferred vector DB (e.g., FAISS, Chroma, PgVector). Use the per record JSON files for richer metadata.
