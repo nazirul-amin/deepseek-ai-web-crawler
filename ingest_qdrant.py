@@ -155,12 +155,12 @@ def main():
     parser.add_argument(
         "--source",
         choices=["jsonl", "records"],
-        default="jsonl",
+        default="records",
         help="Whether to read from JSONL or canonical records directory",
     )
     parser.add_argument(
         "--collection",
-        default=os.environ.get("QDRANT_COLLECTION", "pdn_slider"),
+        default=os.environ.get("QDRANT_COLLECTION", "pdn_chatbot"),
         help="Qdrant collection name",
     )
     parser.add_argument(

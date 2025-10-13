@@ -11,7 +11,7 @@ from bs4 import BeautifulSoup
 from crawl4ai import AsyncWebCrawler, CacheMode, CrawlerRunConfig
 from utils.logger import get_logger
 
-logger = get_logger("pdn_slider")
+logger = get_logger("pdn_homepage")
 
 
 def _ensure_dirs(*dirs: str) -> None:
@@ -219,7 +219,7 @@ async def process_homepage(
     """
     _ensure_dirs(images_dir, rag_dir, os.path.join(rag_dir, "chunks"), os.path.join(rag_dir, "records"))
 
-    html = await fetch_index_html(crawler, page_url, session_id="pdn_slider_session")
+    html = await fetch_index_html(crawler, page_url, session_id="pdn_homepage_session")
     if not html:
         return {"count": 0, "items": []}
 

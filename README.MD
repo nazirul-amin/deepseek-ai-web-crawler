@@ -171,7 +171,7 @@ You can index the generated chunks into Qdrant using the Ollama embeddings API.
 
   ```env
   QDRANT_URL=http://localhost:6333
-  QDRANT_COLLECTION=pdn_slider
+  QDRANT_COLLECTION=pdn_chatbot
   RAG_DIR=data/rag
   OLLAMA_URL=http://localhost:11434
   OLLAMA_MODEL=nomic-embed-text-large
@@ -182,7 +182,7 @@ You can index the generated chunks into Qdrant using the Ollama embeddings API.
   ```bash
   uv run ingest_qdrant.py \
     --source jsonl \
-    --collection pdn_slider \
+    --collection pdn_chatbot \
     --qdrant-url http://localhost:6333 \
     --ollama-url http://localhost:11434 \
     --ollama-model nomic-embed-text-large
