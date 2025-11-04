@@ -158,13 +158,13 @@ FORCE_REPROCESS=1 uv run main.py
 
 ## Qdrant ingestion
 
-You can index the generated chunks into Qdrant using the Ollama embeddings API.
+You can index the generated chunks into Qdrant using either Ollama or OpenAI embeddings.
 
 - **Prerequisites**
 
   - Qdrant running at `QDRANT_URL` (default `http://localhost:6333`).
-  - An Ollama endpoint that supports `/api/embed` with `{ model, input }`.
-  - The model is available on the Ollama server (e.g., `nomic-embed-text-large`).
+  - If using Ollama: an endpoint that supports `/api/embed` with `{ model, input }`, and the model available on the server (e.g., `nomic-embed-text-large`).
+  - If using OpenAI: a valid `OPENAI_API_KEY` and an embedding model (e.g., `text-embedding-3-small`). Optionally, you can override `OPENAI_BASE_URL` for Azure/OpenAI-compatible endpoints.
 
 - **Optional .env entries**:
 
@@ -172,17 +172,37 @@ You can index the generated chunks into Qdrant using the Ollama embeddings API.
   QDRANT_URL=http://localhost:6333
   QDRANT_COLLECTION=pdn_chatbot
   RAG_DIR=data/rag
+  # Select embeddings backend: ollama | openai
+  EMBED_BACKEND=ollama
+
+  # Ollama settings (when EMBED_BACKEND=ollama)
   OLLAMA_URL=http://localhost:11434
   OLLAMA_MODEL=nomic-embed-text-large
+
+  # OpenAI settings (when EMBED_BACKEND=openai)
+  OPENAI_API_KEY=sk-...
+  OPENAI_EMBED_MODEL=text-embedding-3-small
+  # Optional override (e.g., Azure/OpenAI-compatible endpoint)
+  OPENAI_BASE_URL=
   ```
 
 - **Ingest from canonical records directory**
 
-  ```bash
-  uv run ingest_qdrant.py \
-    --ollama-url http://localhost:11434 \
-    --ollama-model nomic-embed-text-large
-  ```
+  - Using Ollama (default):
+
+    ```bash
+    uv run ingest_qdrant.py \
+      --embed-backend ollama \
+      --ollama-url http://localhost:11434 \
+      --ollama-model nomic-embed-text-large
+    ```
+
+  - Using OpenAI:
+    ```bash
+    uv run ingest_qdrant.py \
+      --embed-backend openai \
+      --openai-model text-embedding-3-small
+    ```
 
 ## Configuration
 

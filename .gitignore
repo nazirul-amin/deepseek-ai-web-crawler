@@ -4,3 +4,4 @@ __pycache__
 logs
 rag
 data
+qdrant_data

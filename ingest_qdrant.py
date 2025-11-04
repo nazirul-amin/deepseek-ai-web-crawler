@@ -9,6 +9,7 @@ from qdrant_client.http.models import Distance, VectorParams, PointStruct
 
 from utils.logger import get_logger
 from dotenv import load_dotenv
+from openai import OpenAI
 
 logger = get_logger("ingest_qdrant")
 load_dotenv()
@@ -96,6 +97,21 @@ def embed_texts_ollama(ollama_url: str, ollama_model: str, texts: List[str]):
     return vectors, dim
 
 
+def embed_texts_openai(api_key: str, base_url: str, model: str, texts: List[str]):
+    client = OpenAI(api_key=api_key, base_url=base_url or None)
+    vectors: List[List[float]] = []
+    dim: int = 0
+    for t in texts:
+        resp = client.embeddings.create(model=model, input=t)
+        if not resp.data or not hasattr(resp.data[0], "embedding"):
+            raise RuntimeError("Unexpected OpenAI embeddings response")
+        emb = resp.data[0].embedding
+        if not dim:
+            dim = len(emb)
+        vectors.append(emb)
+    return vectors, dim
+
+
 def ensure_collection(client: QdrantClient, name: str, vector_size: int) -> None:
     try:
         info = client.get_collection(name)
@@ -130,6 +146,12 @@ def batched(iterable: List[int], n: int) -> Iterable[List[int]]:
 def main():
     parser = argparse.ArgumentParser(description="Ingest PDN slider chunks into Qdrant")
     parser.add_argument(
+        "--embed-backend",
+        choices=["ollama", "openai"],
+        default=os.environ.get("EMBED_BACKEND", "ollama"),
+        help="Embeddings backend to use",
+    )
+    parser.add_argument(
         "--rag-dir",
         default=os.environ.get("RAG_DIR", "data/rag"),
         help="Path to rag output directory",
@@ -153,6 +175,16 @@ def main():
         "--ollama-model",
         default=os.environ.get("OLLAMA_MODEL", "nomic-embed-text"),
         help="Ollama embedding model name (when using ollama backend)",
+    )
+    parser.add_argument(
+        "--openai-model",
+        default=os.environ.get("OPENAI_EMBED_MODEL", "text-embedding-3-small"),
+        help="OpenAI embedding model name (when using openai backend)",
+    )
+    parser.add_argument(
+        "--openai-base-url",
+        default=os.environ.get("OPENAI_BASE_URL", ""),
+        help="Override OpenAI base URL (optional)",
     )
     parser.add_argument(
         "--batch-size",
@@ -182,23 +214,32 @@ def main():
         return
 
     logger.info(
-        f"Embedding and upserting {len(records)} records into '{args.collection}' using Ollama embeddings"
+        f"Embedding and upserting {len(records)} records into '{args.collection}' using {args.embed_backend} embeddings"
     )
 
     texts = [r.get("chunk", "") for r in records]
     ids = [str(r.get("id")) for r in records]
     payloads = [build_payload(r) for r in records]
 
-    # Probe dimension with the first text (or a dummy string if empty)
     probe_text = texts[0] or "dim probe"
-    probe_vecs, dim = embed_texts_ollama(args.ollama_url, args.ollama_model, [probe_text])
+    if args.embed_backend == "ollama":
+        probe_vecs, dim = embed_texts_ollama(args.ollama_url, args.ollama_model, [probe_text])
+    else:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise SystemExit("OPENAI_API_KEY is required for openai backend")
+        probe_vecs, dim = embed_texts_openai(api_key, args.openai_base_url, args.openai_model, [probe_text])
     if not probe_vecs or not isinstance(probe_vecs[0], list):
-        raise RuntimeError("Failed to obtain embedding from Ollama for dimension probing")
+        raise RuntimeError("Failed to obtain embedding for dimension probing")
     ensure_collection(client, args.collection, dim)
 
     for batch_ids in batched(list(range(len(texts))), args.batch_size):
         batch_texts = [texts[i] for i in batch_ids]
-        batch_vecs, _ = embed_texts_ollama(args.ollama_url, args.ollama_model, batch_texts)
+        if args.embed_backend == "ollama":
+            batch_vecs, _ = embed_texts_ollama(args.ollama_url, args.ollama_model, batch_texts)
+        else:
+            api_key = os.getenv("OPENAI_API_KEY")
+            batch_vecs, _ = embed_texts_openai(api_key, args.openai_base_url, args.openai_model, batch_texts)
         points = [
             PointStruct(
                 id=str(ids[i]),  # upsert by stable id

@@ -5,3 +5,4 @@ requests
 beautifulsoup4
 qdrant-client
 pypdf
+openai>=1.0.0
