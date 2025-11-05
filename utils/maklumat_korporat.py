@@ -555,6 +555,29 @@ async def process_page(
     logger.info(f"Extracted main content: text_len={len(content_text)}, images={len(imgs)}, links={len(page_links)}")
     title_text = extract_title(html)
 
+    # Build page-level analysis using Groq text model (same model as images), if available
+    page_analysis = None
+    if content_text and groq_api_key and groq_model:
+        try:
+            page_analysis = groq_analyze_text(content_text, groq_api_key, groq_model)
+            if isinstance(page_analysis, dict):
+                try:
+                    logger.info(f"Groq response (page text) keys: {list(page_analysis.keys())}")
+                except Exception:
+                    pass
+                try:
+                    if "raw" in page_analysis:
+                        logger.info("Groq full response (page text, raw): %s", page_analysis.get("raw", ""))
+                    else:
+                        logger.info(
+                            "Groq full response (page text, json): %s",
+                            json.dumps(page_analysis, ensure_ascii=False, indent=2),
+                        )
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning(f"Groq page text analysis failed for {page_url}: {e}")
+
     rec_id = _safe_id(page_url)
     records_dir = os.path.join(rag_dir, "records")
     chunks_dir = os.path.join(rag_dir, "chunks")
@@ -616,6 +639,7 @@ async def process_page(
         "title": title_text,
         "content": content_text,
         "images": image_results,
+        "analysis": page_analysis,
     }
 
     # Chunk: prefer page text, fallback to image analyses summaries

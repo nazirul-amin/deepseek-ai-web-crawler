@@ -47,6 +47,13 @@ essential_meta = [
 
 def build_payload(rec: Dict) -> Dict:
     payload = {k: rec.get(k) for k in essential_meta if k in rec}
+    # Include record type for downstream filtering
+    if "type" in rec:
+        payload["type"] = rec.get("type")
+    # Include the text used for embeddings so the chatbot can display/use it directly
+    text = rec.get("chunk") or ""
+    if text:
+        payload["text"] = text
     analysis = rec.get("analysis") or {}
     if isinstance(analysis, dict):
         payload["analysis"] = analysis
