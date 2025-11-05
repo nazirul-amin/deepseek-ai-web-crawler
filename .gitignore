@@ -2,6 +2,5 @@
 *.csv
 __pycache__
 logs
-rag
 data
 qdrant_data

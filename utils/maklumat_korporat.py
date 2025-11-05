@@ -238,6 +238,142 @@ def extract_title(html: str) -> Optional[str]:
     return None
 
 
+def _strip_code_fences(text: str) -> str:
+    try:
+        t = text.strip()
+        if t.startswith("```"):
+            # remove the first fence line (e.g., ```json) including any language tag
+            t = t.split("\n", 1)[1] if "\n" in t else ""
+        if t.endswith("```"):
+            t = t[: t.rfind("```")]
+        return t.strip()
+    except Exception:
+        return text
+
+
+def _parse_analysis_obj(a: Optional[Dict]) -> Optional[Dict]:
+    if not isinstance(a, dict):
+        return None
+    out: Dict = {
+        "title": a.get("title"),
+        "summary": a.get("summary"),
+        "language": a.get("language"),
+        "labels": a.get("labels") if isinstance(a.get("labels"), list) else [],
+        "entities": a.get("entities") if isinstance(a.get("entities"), list) else [],
+        "date": a.get("date"),
+        "urls": a.get("urls") if isinstance(a.get("urls"), list) else [],
+        "raw": a.get("raw") if isinstance(a.get("raw"), str) else None,
+    }
+    raw_txt = out.get("raw")
+    if raw_txt and not out.get("summary"):
+        try:
+            stripped = _strip_code_fences(raw_txt)
+            parsed = json.loads(stripped)
+            if isinstance(parsed, dict):
+                out["title"] = out.get("title") or parsed.get("title")
+                out["summary"] = out.get("summary") or parsed.get("summary")
+                out["language"] = out.get("language") or parsed.get("language")
+                if not out.get("labels") and isinstance(parsed.get("labels"), list):
+                    out["labels"] = parsed.get("labels")
+                if not out.get("entities") and isinstance(parsed.get("entities"), list):
+                    out["entities"] = parsed.get("entities")
+                out["date"] = out.get("date") or parsed.get("date")
+                if not out.get("urls") and isinstance(parsed.get("urls"), list):
+                    out["urls"] = parsed.get("urls")
+        except Exception:
+            pass
+    return out
+
+
+def _derive_text_from_filename(url: Optional[str]) -> str:
+    try:
+        if not url:
+            return ""
+        name = os.path.basename(urlparse(url).path)
+        name = os.path.splitext(name)[0]
+        return name.replace("_", " ").replace("-", " ")
+    except Exception:
+        return ""
+
+
+def normalize_record(record: Dict) -> Dict:
+    rec = dict(record)
+    rec.setdefault("document_path", rec.get("document_path") or None)
+    rec.setdefault("images", rec.get("images") or [])
+
+    # Normalize per-image analyses
+    imgs = []
+    for it in rec.get("images", []) or []:
+        img = dict(it)
+        img["analysis"] = _parse_analysis_obj(img.get("analysis"))
+        imgs.append(img)
+    rec["images"] = imgs
+
+    # Root analysis
+    root_analysis = _parse_analysis_obj(rec.get("analysis"))
+    if not root_analysis:
+        # Prefer first image analysis if present
+        if rec.get("type") == "image" and rec.get("images"):
+            root_analysis = rec["images"][0].get("analysis")
+        elif rec.get("type") == "page" and rec.get("images"):
+            # Aggregate best available
+            for im in rec["images"]:
+                cand = im.get("analysis")
+                if cand and (cand.get("summary") or cand.get("ocr_text")):
+                    root_analysis = cand
+                    break
+        # If still None, synthesize minimal
+        if not root_analysis:
+            root_analysis = {
+                "title": rec.get("title"),
+                "summary": None,
+                "language": None,
+                "labels": [],
+                "entities": [],
+                "date": None,
+                "urls": [],
+                "raw": None,
+            }
+    rec["analysis"] = root_analysis
+
+    # Title fallback from analysis
+    if not rec.get("title") and isinstance(rec.get("analysis"), dict):
+        rec["title"] = rec["analysis"].get("title")
+
+    # Build chunk if empty
+    chunk = (rec.get("chunk") or "").strip()
+    if not chunk:
+        # 1) analysis.summary
+        if isinstance(rec.get("analysis"), dict) and rec["analysis"].get("summary"):
+            chunk = str(rec["analysis"]["summary"]).strip()
+        # 2) content (pdf/page)
+        if not chunk:
+            content = (rec.get("content") or "").strip()
+            if content:
+                chunk = content[:6000]
+        # 3) image analyses
+        if not chunk and rec.get("images"):
+            parts: List[str] = []
+            for im in rec["images"]:
+                a = im.get("analysis") or {}
+                if isinstance(a, dict):
+                    txt = a.get("summary") or a.get("ocr_text")
+                    if txt:
+                        parts.append(str(txt))
+            chunk = "\n".join(parts).strip()
+        # 4) image alt text
+        if not chunk and rec.get("images"):
+            alts = [im.get("alt") for im in rec["images"] if im.get("alt")]
+            if alts:
+                chunk = "\n".join(alts)
+        # 5) derive from filename
+        if not chunk:
+            chunk = _derive_text_from_filename(rec.get("source_url"))
+    rec["chunk"] = chunk or ""
+
+    return rec
+
+
 async def process_page(
     crawler: AsyncWebCrawler,
     page_url: str,
@@ -332,8 +468,9 @@ async def process_page(
             "chunk": chunk_text,
         }
 
+        record = normalize_record(record)
         with open(chunk_path, "w", encoding="utf-8") as f:
-            f.write(chunk_text)
+            f.write(record.get("chunk", ""))
         with open(record_path, "w", encoding="utf-8") as f:
             json.dump(record, f, ensure_ascii=False, indent=2)
         logger.info(f"Wrote image record id={rec_id}, chunk_len={len(chunk_text)} -> {record_path}")
@@ -384,7 +521,7 @@ async def process_page(
         if isinstance(analysis, dict):
             chunk_text = (analysis.get("summary") or "").strip()
         if not chunk_text:
-            chunk_text = (doc_text or "")[:6000]
+            chunk_text = (doc_text or "")
 
         record: Dict = {
             "id": rec_id,
@@ -398,8 +535,9 @@ async def process_page(
             "chunk": chunk_text,
         }
 
+        record = normalize_record(record)
         with open(chunk_path, "w", encoding="utf-8") as f:
-            f.write(chunk_text)
+            f.write(record.get("chunk", ""))
         with open(record_path, "w", encoding="utf-8") as f:
             json.dump(record, f, ensure_ascii=False, indent=2)
         return record
@@ -493,14 +631,14 @@ async def process_page(
         chunk_text = "\n".join(parts)
     if not chunk_text:
         chunk_text = ""
-    if len(chunk_text) > 6000:
-        chunk_text = chunk_text[:6000]
 
     record["chunk"] = chunk_text
 
+    record = normalize_record(record)
+
     # Write chunk and record
     with open(chunk_path, "w", encoding="utf-8") as f:
-        f.write(chunk_text)
+        f.write(record.get("chunk", ""))
     with open(record_path, "w", encoding="utf-8") as f:
         json.dump(record, f, ensure_ascii=False, indent=2)
     logger.info(f"Wrote page record id={rec_id}, title={title_text!r}, chunk_len={len(chunk_text)} -> {record_path}")

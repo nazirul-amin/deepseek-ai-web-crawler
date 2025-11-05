@@ -39,6 +39,120 @@ def _file_sha256(local_path: str) -> str:
     return h.hexdigest()
 
 
+def _strip_code_fences(text: str) -> str:
+    try:
+        t = (text or "").strip()
+        if t.startswith("```"):
+            # remove the first fence line (e.g., ```json) including any language tag
+            t = t.split("\n", 1)[1] if "\n" in t else ""
+        if t.endswith("```"):
+            t = t[: t.rfind("```")]
+        return t.strip()
+    except Exception:
+        return text
+
+
+def _parse_analysis_obj(a: Optional[Dict]) -> Optional[Dict]:
+    if not isinstance(a, dict):
+        return None
+    out: Dict = {
+        "title": a.get("title"),
+        "summary": a.get("summary"),
+        "language": a.get("language"),
+        "labels": a.get("labels") if isinstance(a.get("labels"), list) else [],
+        "entities": a.get("entities") if isinstance(a.get("entities"), list) else [],
+        "date": a.get("date"),
+        "urls": a.get("urls") if isinstance(a.get("urls"), list) else [],
+        "raw": a.get("raw") if isinstance(a.get("raw"), str) else None,
+    }
+    raw_txt = out.get("raw")
+    if raw_txt and not out.get("summary"):
+        try:
+            stripped = _strip_code_fences(raw_txt)
+            parsed = json.loads(stripped)
+            if isinstance(parsed, dict):
+                out["title"] = out.get("title") or parsed.get("title")
+                out["summary"] = out.get("summary") or parsed.get("summary")
+                out["language"] = out.get("language") or parsed.get("language")
+                if not out.get("labels") and isinstance(parsed.get("labels"), list):
+                    out["labels"] = parsed.get("labels")
+                if not out.get("entities") and isinstance(parsed.get("entities"), list):
+                    out["entities"] = parsed.get("entities")
+                out["date"] = out.get("date") or parsed.get("date")
+                if not out.get("urls") and isinstance(parsed.get("urls"), list):
+                    out["urls"] = parsed.get("urls")
+        except Exception:
+            pass
+    return out
+
+
+def _derive_text_from_filename(url: Optional[str]) -> str:
+    try:
+        if not url:
+            return ""
+        name = os.path.basename(urlparse(url).path)
+        name = os.path.splitext(name)[0]
+        return name.replace("_", " ").replace("-", " ")
+    except Exception:
+        return ""
+
+
+def _normalize_image_record(record: Dict) -> Dict:
+    rec = dict(record)
+    # Per-image analysis normalization
+    imgs = []
+    for it in rec.get("images", []) or []:
+        img = dict(it)
+        img["analysis"] = _parse_analysis_obj(img.get("analysis"))
+        imgs.append(img)
+    rec["images"] = imgs
+
+    # Root analysis: prefer first image analysis
+    root_analysis = _parse_analysis_obj(rec.get("analysis"))
+    if not root_analysis and rec.get("images"):
+        root_analysis = rec["images"][0].get("analysis")
+    if not root_analysis:
+        root_analysis = {
+            "title": rec.get("title"),
+            "summary": None,
+            "language": None,
+            "labels": [],
+            "entities": [],
+            "date": None,
+            "urls": [],
+            "raw": None,
+        }
+    rec["analysis"] = root_analysis
+
+    # Title fallback from analysis
+    if not rec.get("title") and isinstance(rec.get("analysis"), dict):
+        rec["title"] = rec["analysis"].get("title")
+
+    # Build chunk if empty
+    chunk = (rec.get("chunk") or "").strip()
+    if not chunk:
+        if rec["analysis"].get("summary"):
+            chunk = str(rec["analysis"]["summary"]).strip()
+        if not chunk and rec.get("images"):
+            parts: List[str] = []
+            for im in rec["images"]:
+                a = im.get("analysis") or {}
+                if isinstance(a, dict):
+                    txt = a.get("summary") or a.get("ocr_text")
+                    if txt:
+                        parts.append(str(txt))
+            chunk = "\n".join(parts).strip()
+        if not chunk:
+            alts = [im.get("alt") for im in rec.get("images", []) if im.get("alt")]
+            if alts:
+                chunk = "\n".join(alts)
+        if not chunk:
+            chunk = _derive_text_from_filename(rec.get("source_url"))
+    rec["chunk"] = chunk or ""
+    rec.setdefault("document_path", None)
+    rec.setdefault("content", "")
+    return rec
+
 async def fetch_index_html(crawler: AsyncWebCrawler, url: str, session_id: str) -> Optional[str]:
     result = await crawler.arun(
         url=url,
@@ -268,24 +382,36 @@ async def process_homepage(
                     )
         except Exception:
             pass
-        chunk_text = analysis.get("summary") or analysis.get("ocr_text") or json.dumps(analysis)[:1000]
-
+        # Build unified image record schema
         record = {
             "id": rec_id,
+            "type": "image",
             "source_url": src_url,
-            "local_path": local,
+            "title": item.get("title") or None,
+            "content": "",
+            "images": [
+                {
+                    "source_url": src_url,
+                    "alt": item.get("alt", ""),
+                    "local_path": local,
+                    "analysis": analysis,
+                }
+            ],
+            "document_path": None,
+            "analysis": analysis,  # will be normalized
+            "chunk": analysis.get("summary") or analysis.get("ocr_text") or "",
+            # carry-through meta that ingest_qdrant may include in payload
             "alt": item.get("alt", ""),
-            "title": item.get("title", ""),
             "public_id": item.get("public_id"),
             "llm_model": groq_model,
             "image_sha256": _file_sha256(local),
-            "analysis": analysis,
-            "chunk": chunk_text,
         }
+
+        record = _normalize_image_record(record)
 
         # Write chunk file for easy ingestion
         with open(chunk_path, "w", encoding="utf-8") as f:
-            f.write(chunk_text)
+            f.write(record.get("chunk", ""))
 
         # Write canonical per-record JSON (overwrites to keep latest)
         with open(record_path, "w", encoding="utf-8") as f:
@@ -293,7 +419,7 @@ async def process_homepage(
 
         processed.append(record)
         logger.info(
-            f"Wrote slider record id={rec_id}, chunk_len={len(chunk_text)}, local_image={local} -> {record_path}"
+            f"Wrote slider record id={rec_id}, chunk_len={len(record.get('chunk', ''))}, local_image={local} -> {record_path}"
         )
 
     return {"count": len(processed), "items": processed}
