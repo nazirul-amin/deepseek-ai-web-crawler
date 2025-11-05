@@ -10,10 +10,15 @@ from crawl4ai import AsyncWebCrawler, CacheMode, CrawlerRunConfig
 from pypdf import PdfReader
 
 from utils.logger import get_logger
-from utils.homepage import download_image, groq_analyze_image  # reuse
+from utils.homepage import download_image, analyze_image
+from config import OPENAI_MODEL
 
 logger = get_logger("pdn_maklumat_korporat")
 
+def _sha256_text(text: str) -> str:
+    h = hashlib.sha256()
+    h.update((text or "").encode("utf-8"))
+    return h.hexdigest()
 
 def _ensure_dirs(*dirs: str) -> None:
     for d in dirs:
@@ -113,8 +118,6 @@ def groq_analyze_text(doc_text: str, api_key: Optional[str], model: Optional[str
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": f"{user_text}\n\nTEXT:\n{doc_text}"},
         ],
-        temperature=0.2,
-        max_tokens=1200,
     )
     text = completion.choices[0].message.content or "{}"
     try:
@@ -122,6 +125,51 @@ def groq_analyze_text(doc_text: str, api_key: Optional[str], model: Optional[str
     except Exception:
         return {"raw": text}
 
+
+def openai_analyze_text(doc_text: str) -> Optional[Dict]:
+    """Analyze plain text with OpenAI and return structured JSON similar to image analysis.
+    Reads OPENAI_API_KEY and OPENAI_MODEL from env.
+    """
+    import os as _os
+    api_key = _os.getenv("OPENAI_API_KEY")
+    model = OPENAI_MODEL
+    if not api_key:
+        return None
+    try:
+        from openai import OpenAI
+    except Exception:
+        return None
+    client = OpenAI(api_key=api_key)
+    system_prompt = (
+        "You analyze document text and return structured JSON. "
+        "Extract: title, summary (<= 120 words), language, labels (list), entities (list), "
+        "date (if any), urls (list). Respond with ONLY valid JSON."
+    )
+    user_text = (
+        "Analyze the following document text and extract the requested fields. "
+        "If no explicit title, infer a concise one."
+    )
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"{user_text}\n\nTEXT:\n{doc_text}"},
+        ],
+    )
+    text = resp.choices[0].message.content or "{}"
+    try:
+        return json.loads(text)
+    except Exception:
+        return {"raw": text}
+
+
+def analyze_text(doc_text: str, api_key: Optional[str], llm_model: Optional[str]) -> Optional[Dict]:
+    """Provider-aware text analysis selecting Groq (default) or OpenAI based on ANALYSIS_PROVIDER."""
+    import os as _os
+    provider = (_os.getenv("ANALYSIS_PROVIDER") or "groq").lower()
+    if provider == "openai":
+        return openai_analyze_text(doc_text)
+    return groq_analyze_text(doc_text, api_key, llm_model)
 
 def parse_nav_links(nav_html: str, base_url: str) -> List[str]:
     """Extract ONLY 'Maklumat Korporat' navigation links.
@@ -380,8 +428,8 @@ async def process_page(
     base_url: str,
     images_dir: str,
     rag_dir: str,
-    groq_api_key: Optional[str],
-    groq_model: Optional[str],
+    api_key: Optional[str],
+    llm_model: Optional[str],
     *,
     force: bool = False,
     visited: Optional[Set[str]] = None,
@@ -424,32 +472,33 @@ async def process_page(
         else:
             logger.warning(f"Image download failed: {page_url}")
         analysis = None
-        if local_path and groq_api_key and groq_model:
+        if local_path:
             try:
-                logger.info(f"Invoking Groq Vision for image: {page_url}")
-                analysis = groq_analyze_image(local_path, groq_api_key, groq_model)
+                logger.info(f"Invoking analysis for image: {page_url}")
+                analysis = analyze_image(local_path, api_key, llm_model)
                 try:
-                    logger.info(f"Groq response (image) keys: {list(analysis.keys()) if isinstance(analysis, dict) else 'n/a'}")
+                    logger.info(f"Analysis (image) keys: {list(analysis.keys()) if isinstance(analysis, dict) else 'n/a'}")
                 except Exception:
                     pass
                 # Log full Groq response for visibility
                 try:
                     if isinstance(analysis, dict):
                         if "raw" in analysis:
-                            logger.info("Groq full response (image, raw): %s", analysis.get("raw", ""))
+                            logger.info("Analysis full response (image, raw): %s", analysis.get("raw", ""))
                         else:
                             logger.info(
-                                "Groq full response (image, json): %s",
+                                "Analysis full response (image, json): %s",
                                 json.dumps(analysis, ensure_ascii=False, indent=2),
                             )
                 except Exception:
                     pass
             except Exception as e:
-                logger.warning(f"Groq image analysis failed for {page_url}: {e}")
+                logger.warning(f"Image analysis failed for {page_url}: {e}")
         # Build minimal content from analysis
         chunk_text = ""
         if isinstance(analysis, dict):
-            chunk_text = (analysis.get("summary") or analysis.get("ocr_text") or "").strip()
+            # Prefer full OCR text over summary for image records
+            chunk_text = (analysis.get("ocr_text") or analysis.get("summary") or "").strip()
 
         record: Dict = {
             "id": rec_id,
@@ -469,6 +518,8 @@ async def process_page(
         }
 
         record = normalize_record(record)
+        # Hash the final chunk text
+        record["text_sha256"] = _sha256_text(record.get("chunk", ""))
         with open(chunk_path, "w", encoding="utf-8") as f:
             f.write(record.get("chunk", ""))
         with open(record_path, "w", encoding="utf-8") as f:
@@ -500,21 +551,18 @@ async def process_page(
             logger.warning(f"PDF download failed: {page_url}")
         doc_text = extract_pdf_text(local_path) if local_path else ""
         logger.info(f"Extracted PDF text length: {len(doc_text)}")
-        analysis = groq_analyze_text(doc_text, groq_api_key, groq_model) if doc_text else None
+        analysis = analyze_text(doc_text, api_key, llm_model) if doc_text else None
         if isinstance(analysis, dict):
             try:
-                logger.info(f"Groq response (pdf) keys: {list(analysis.keys())}")
+                logger.info(f"Analysis (pdf) keys: {list(analysis.keys())}")
             except Exception:
                 pass
             # Log full Groq response for visibility
             try:
                 if "raw" in analysis:
-                    logger.info("Groq full response (pdf, raw): %s", analysis.get("raw", ""))
+                    logger.info("Analysis full response (pdf, raw): %s", analysis.get("raw", ""))
                 else:
-                    logger.info(
-                        "Groq full response (pdf, json): %s",
-                        json.dumps(analysis, ensure_ascii=False, indent=2),
-                    )
+                    logger.info("Analysis full response (pdf, json): %s", json.dumps(analysis, ensure_ascii=False, indent=2))
             except Exception:
                 pass
         chunk_text = ""
@@ -536,6 +584,9 @@ async def process_page(
         }
 
         record = normalize_record(record)
+        # Hash full content and final chunk
+        record["content_sha256"] = _sha256_text(doc_text)
+        record["text_sha256"] = _sha256_text(record.get("chunk", ""))
         with open(chunk_path, "w", encoding="utf-8") as f:
             f.write(record.get("chunk", ""))
         with open(record_path, "w", encoding="utf-8") as f:
@@ -555,28 +606,25 @@ async def process_page(
     logger.info(f"Extracted main content: text_len={len(content_text)}, images={len(imgs)}, links={len(page_links)}")
     title_text = extract_title(html)
 
-    # Build page-level analysis using Groq text model (same model as images), if available
+    # Build page-level analysis using selected provider, if available
     page_analysis = None
-    if content_text and groq_api_key and groq_model:
+    if content_text:
         try:
-            page_analysis = groq_analyze_text(content_text, groq_api_key, groq_model)
+            page_analysis = analyze_text(content_text, api_key, llm_model)
             if isinstance(page_analysis, dict):
                 try:
-                    logger.info(f"Groq response (page text) keys: {list(page_analysis.keys())}")
+                    logger.info(f"Analysis (page text) keys: {list(page_analysis.keys())}")
                 except Exception:
                     pass
                 try:
                     if "raw" in page_analysis:
-                        logger.info("Groq full response (page text, raw): %s", page_analysis.get("raw", ""))
+                        logger.info("Analysis full response (page text, raw): %s", page_analysis.get("raw", ""))
                     else:
-                        logger.info(
-                            "Groq full response (page text, json): %s",
-                            json.dumps(page_analysis, ensure_ascii=False, indent=2),
-                        )
+                        logger.info("Analysis full response (page text, json): %s", json.dumps(page_analysis, ensure_ascii=False, indent=2))
                 except Exception:
                     pass
         except Exception as e:
-            logger.warning(f"Groq page text analysis failed for {page_url}: {e}")
+            logger.warning(f"Page text analysis failed for {page_url}: {e}")
 
     rec_id = _safe_id(page_url)
     records_dir = os.path.join(rag_dir, "records")
@@ -602,28 +650,28 @@ async def process_page(
         else:
             logger.warning(f"Page image download failed: {abs_src}")
         analysis = None
-        if local_path and groq_api_key and groq_model:
+        if local_path:
             try:
-                logger.info(f"Invoking Groq Vision for page image: {abs_src}")
-                analysis = groq_analyze_image(local_path, groq_api_key, groq_model)
+                logger.info(f"Invoking analysis for page image: {abs_src}")
+                analysis = analyze_image(local_path, api_key, llm_model)
                 try:
-                    logger.info(f"Groq response (page image) keys: {list(analysis.keys()) if isinstance(analysis, dict) else 'n/a'}")
+                    logger.info(f"Analysis (page image) keys: {list(analysis.keys()) if isinstance(analysis, dict) else 'n/a'}")
                 except Exception:
                     pass
-                # Log full Groq response for visibility
+                # Log full provider response for visibility
                 try:
                     if isinstance(analysis, dict):
                         if "raw" in analysis:
-                            logger.info("Groq full response (page image, raw): %s", analysis.get("raw", ""))
+                            logger.info("Analysis full response (page image, raw): %s", analysis.get("raw", ""))
                         else:
                             logger.info(
-                                "Groq full response (page image, json): %s",
+                                "Analysis full response (page image, json): %s",
                                 json.dumps(analysis, ensure_ascii=False, indent=2),
                             )
                 except Exception:
                     pass
             except Exception as e:
-                logger.warning(f"Groq analysis failed for {abs_src}: {e}")
+                logger.warning(f"Image analysis failed for {abs_src}: {e}")
         image_results.append({
             "source_url": abs_src,
             "alt": it.get("alt", ""),
@@ -659,6 +707,9 @@ async def process_page(
     record["chunk"] = chunk_text
 
     record = normalize_record(record)
+    # Hash full page content and final chunk
+    record["content_sha256"] = _sha256_text(content_text)
+    record["text_sha256"] = _sha256_text(record.get("chunk", ""))
 
     # Write chunk and record
     with open(chunk_path, "w", encoding="utf-8") as f:
@@ -684,8 +735,8 @@ async def process_page(
                             base_url=base_url,
                             images_dir=images_dir,
                             rag_dir=rag_dir,
-                            groq_api_key=groq_api_key,
-                            groq_model=groq_model,
+                            api_key=api_key,
+                            llm_model=llm_model,
                             force=force,
                             visited=visited,
                             max_depth=max_depth,
@@ -703,8 +754,8 @@ async def crawl_maklumat_korporate(
     images_dir: str,
     rag_dir: str,
     *,
-    groq_api_key: Optional[str] = None,
-    groq_model: Optional[str] = None,
+    api_key: Optional[str] = None,
+    llm_model: Optional[str] = None,
     force: bool = False,
 ) -> Dict:
     """
@@ -736,8 +787,8 @@ async def crawl_maklumat_korporate(
                 base_url=base_url,
                 images_dir=images_dir,
                 rag_dir=rag_dir,
-                groq_api_key=groq_api_key,
-                groq_model=groq_model,
+                api_key=api_key,
+                llm_model=llm_model,
                 force=force,
                 visited=visited,
                 max_depth=1,

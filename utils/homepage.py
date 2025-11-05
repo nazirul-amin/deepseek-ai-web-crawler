@@ -11,6 +11,8 @@ from bs4 import BeautifulSoup
 from crawl4ai import AsyncWebCrawler, CacheMode, CrawlerRunConfig
 from utils.logger import get_logger
 
+from config import OPENAI_MODEL
+
 logger = get_logger("pdn_homepage")
 
 
@@ -38,6 +40,11 @@ def _file_sha256(local_path: str) -> str:
             h.update(chunk)
     return h.hexdigest()
 
+
+def _sha256_text(text: str) -> str:
+    h = hashlib.sha256()
+    h.update((text or "").encode("utf-8"))
+    return h.hexdigest()
 
 def _strip_code_fences(text: str) -> str:
     try:
@@ -308,8 +315,6 @@ def groq_analyze_image(local_path: str, api_key: str, model: str) -> Dict:
                 ],
             },
         ],
-        temperature=0.2,
-        max_tokens=1200,
     )
 
     text = completion.choices[0].message.content or "{}"
@@ -319,13 +324,69 @@ def groq_analyze_image(local_path: str, api_key: str, model: str) -> Dict:
         return {"raw": text}
 
 
+def openai_analyze_image(local_path: str, api_key: str, model: str) -> Dict:
+    try:
+        # OpenAI SDK
+        from openai import OpenAI
+    except Exception as e:
+        raise RuntimeError(
+            "OpenAI SDK is not installed. Install dependencies (e.g., `uv pip install openai`)."
+        ) from e
+
+    client = OpenAI(api_key=api_key)
+    data_url = _b64_data_url(local_path)
+
+    system_prompt = (
+        "You analyze banner images and return structured JSON. "
+        "Extract: title, summary, language, ocr_text, labels (list), entities (list), "
+        "date (if any), call_to_action (if any), urls (list of any URLs found). "
+        "Respond with ONLY valid JSON."
+    )
+    user_text = (
+        "Analyze this image and extract the requested fields. "
+        "Keep summary concise for RAG (<= 80 words)."
+    )
+
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_text},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            },
+        ],
+    )
+    text = resp.choices[0].message.content or "{}"
+    try:
+        return json.loads(text)
+    except Exception:
+        return {"raw": text}
+
+
+def analyze_image(local_path: str, api_key: Optional[str], llm_model: Optional[str]) -> Dict:
+    provider = (os.getenv("ANALYSIS_PROVIDER") or "groq").lower()
+    if provider == "openai":
+        openai_key = os.getenv("OPENAI_API_KEY")
+        openai_model = OPENAI_MODEL
+        if not openai_key:
+            raise RuntimeError("OPENAI_API_KEY not set but ANALYSIS_PROVIDER=openai")
+        return openai_analyze_image(local_path, api_key=openai_key, model=openai_model)
+    # default: groq
+    if not (api_key and llm_model):
+        raise RuntimeError("API_KEY/LLM_MODEL not provided and ANALYSIS_PROVIDER!=openai")
+    return groq_analyze_image(local_path, api_key=api_key, model=llm_model)
+
 async def process_homepage(
     crawler: AsyncWebCrawler,
     page_url: str,
     images_dir: str,
     rag_dir: str,
-    groq_api_key: str,
-    groq_model: str,
+    api_key: Optional[str],
+    llm_model: Optional[str],
     *,
     force: bool = False,
 ) -> Dict:
@@ -362,11 +423,11 @@ async def process_homepage(
             logger.warning(f"Slider image download failed: {src_url}")
             continue
 
-        logger.info(f"Invoking Groq Vision for slider image: {src_url}")
-        analysis = groq_analyze_image(local, api_key=groq_api_key, model=groq_model)
+        logger.info(f"Invoking analysis for slider image: {src_url}")
+        analysis = analyze_image(local, api_key=api_key, llm_model=llm_model)
         try:
             logger.info(
-                f"Groq response (slider image) keys: {list(analysis.keys()) if isinstance(analysis, dict) else 'n/a'}"
+                f"Analysis (slider image) keys: {list(analysis.keys()) if isinstance(analysis, dict) else 'n/a'}"
             )
         except Exception:
             pass
@@ -374,15 +435,19 @@ async def process_homepage(
         try:
             if isinstance(analysis, dict):
                 if "raw" in analysis:
-                    logger.info("Groq full response (slider image, raw): %s", analysis.get("raw", ""))
+                    logger.info("Analysis full response (slider image, raw): %s", analysis.get("raw", ""))
                 else:
                     logger.info(
-                        "Groq full response (slider image, json): %s",
+                        "Analysis full response (slider image, json): %s",
                         json.dumps(analysis, ensure_ascii=False, indent=2),
                     )
         except Exception:
             pass
         # Build unified image record schema
+        # Determine which model was actually used for analysis
+        _provider = (os.getenv("ANALYSIS_PROVIDER") or "groq").lower()
+        _llm_model_used = OPENAI_MODEL if _provider == "openai" else llm_model
+
         record = {
             "id": rec_id,
             "type": "image",
@@ -399,15 +464,17 @@ async def process_homepage(
             ],
             "document_path": None,
             "analysis": analysis,  # will be normalized
-            "chunk": analysis.get("summary") or analysis.get("ocr_text") or "",
+            # Prefer full OCR text for image chunks so chatbot sees all text in the image
+            "chunk": analysis.get("ocr_text") or analysis.get("summary") or "",
             # carry-through meta that ingest_qdrant may include in payload
             "alt": item.get("alt", ""),
             "public_id": item.get("public_id"),
-            "llm_model": groq_model,
+            "llm_model": _llm_model_used,
             "image_sha256": _file_sha256(local),
         }
 
         record = _normalize_image_record(record)
+        record["text_sha256"] = _sha256_text(record.get("chunk", ""))
 
         # Write chunk file for easy ingestion
         with open(chunk_path, "w", encoding="utf-8") as f:

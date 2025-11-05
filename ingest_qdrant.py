@@ -11,6 +11,8 @@ from utils.logger import get_logger
 from dotenv import load_dotenv
 from openai import OpenAI
 
+from config import OPENAI_BASE_URL, OPENAI_EMBED_MODEL
+
 logger = get_logger("ingest_qdrant")
 load_dotenv()
 
@@ -54,6 +56,11 @@ def build_payload(rec: Dict) -> Dict:
     text = rec.get("chunk") or ""
     if text:
         payload["text"] = text
+    # Include hashes if available for ops/dedup/change detection
+    if rec.get("content_sha256"):
+        payload["content_sha256"] = rec["content_sha256"]
+    if rec.get("text_sha256"):
+        payload["text_sha256"] = rec["text_sha256"]
     analysis = rec.get("analysis") or {}
     if isinstance(analysis, dict):
         payload["analysis"] = analysis
@@ -185,12 +192,12 @@ def main():
     )
     parser.add_argument(
         "--openai-model",
-        default=os.environ.get("OPENAI_EMBED_MODEL", "text-embedding-3-small"),
+        default=OPENAI_EMBED_MODEL,
         help="OpenAI embedding model name (when using openai backend)",
     )
     parser.add_argument(
         "--openai-base-url",
-        default=os.environ.get("OPENAI_BASE_URL", ""),
+        default=OPENAI_BASE_URL,
         help="Override OpenAI base URL (optional)",
     )
     parser.add_argument(
