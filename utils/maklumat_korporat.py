@@ -748,7 +748,7 @@ async def process_page(
     return record
 
 
-async def crawl_maklumat_korporate(
+async def crawl_maklumat_korporat(
     crawler: AsyncWebCrawler,
     base_url: str,
     images_dir: str,
